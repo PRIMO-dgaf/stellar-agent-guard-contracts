@@ -610,7 +610,8 @@ mod tests {
         let env = Env::default();
         let sa = self_addr(&env);
         // Allowlist is [addr(2)]; the spender addr(7) is deliberately NOT listed.
-        let p = base_policy(&env);
+        let mut p = base_policy(&env);
+        p.window_cap = 100;
         let mut l = Ledger::empty(&env);
         // Recipient args[2]=addr(2) is allowlisted even though spender
         // args[1]=addr(7) is not.

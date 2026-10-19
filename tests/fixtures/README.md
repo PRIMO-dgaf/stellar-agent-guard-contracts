@@ -10,6 +10,12 @@ Nothing here is simulated.
 - RPC used for submissions: `https://soroban-testnet.stellar.org`
 - Horizon used for verification: `https://horizon-testnet.stellar.org`
 
+This file is the on-chain half of [SECURITY.md § Verified against](../../SECURITY.md#verified-against):
+that section names the protocol and `soroban-sdk` version, and this file records
+the transactions that prove the behaviour on them. `index.json` mirrors the
+network (including `network.protocol: 28`) so the claim is machine-checkable;
+when the protocol or SDK changes, both files move together.
+
 ## Deployed contracts
 
 | Component | Address |
@@ -68,6 +74,20 @@ what Phase 2's SDK must do:
 Each invocation uses a fresh tx sequence as the auth nonce (the SAC's replay
 protection records every consumed nonce on-chain; the guard's own `__check_auth`
 ignores nonces, per SPEC §6).
+
+`agent-tx transfer-from` now builds `transfer_from(from, guard, to, amount)` with
+the guard as spender and preserves the token contract's exact argument order.
+This path is not demonstrated by the live fixtures: no allowance transaction
+was run or verified for the deployed testnet token.
+
+## How to read the blocks
+
+Every scenario block below carries the account state that produced its result —
+inline on the command or on the line directly above it — and live runs also
+carry the transaction hash and ledger that prove them. This is the same convention as the README's
+["How to read the output blocks"](../../README.md#how-to-read-the-output-blocks-in-this-readme)
+(issue #418): a block with no state line should not be cited as evidence, and a
+blocked result is only meaningful relative to the state that produced it.
 
 ## The five scenarios — real results
 
@@ -183,6 +203,124 @@ agent-tx transfer … --amount 10
 
 Horizon: `successful: true`, ledger 4566327, created 08:13:42Z.
 
+## Planned scenarios 6-8 (pending live run - issue #49)
+
+Scenarios 6-8 are defined in SPEC section 11 to the same evidentiary standard
+as 1-5, but their live runs have not happened yet: nothing below has a hash,
+a ledger, or a timestamp, and `index.json` stays at `schema_version: 1` with
+scenarios 1-5 until the executing PR records them. Scenario 6 absorbs issue #5
+(agent-key rotation proof); the executing PR closes #5 and #49 together.
+
+Conventions: `<GUARD>`, `<TOKEN>`, `<ADMIN>` are the canonical deployment from
+the tables above. `<PROTOCOL>` is a minimal protocol contract deployed fresh
+at run time (any contract with two functions, e.g. `ping` allowlisted and
+`admin_fn` denied - its contract ID is recorded then). `<NEW_PUBKEY_HEX>` is
+the 64-character raw Ed25519 public key of a fresh agent keypair (derive it
+with `cargo run --example agent_pubkey`); `<OLD_SECRET>` / `<NEW_SECRET>` are
+the corresponding secrets. Every `(recorded at run time)` marker below is a
+value the executing PR fills in, in both this prose and `index.json`.
+
+### 6. Agent-key rotation + old-key rejection (pending)
+
+Precondition: the account is live - `status` shows `admin_frozen: false` and
+`heartbeat_expired: false` (run `unfreeze` and/or install a scenario policy
+first; record each admin hash as a setup entry). Read `status` before starting
+(the `last_heartbeat` value is needed for the DMS-interplay assertion).
+
+1. Admin rotates with the stellar CLI under the current admin identity:
+
+```text
+stellar contract invoke --id <GUARD> --network testnet \
+  --source-account <ADMIN> --send=yes -- \
+  rotate_agent_key --new_pubkey <NEW_PUBKEY_HEX>
+(recorded at run time: tx hash, event_agent_rotated old/new fingerprints)
+```
+
+2. Old key rejected. A transfer signed with the old secret never authorizes:
+signature verification traps before policy evaluation, so there are no
+`auth_checked` topics - the evidence is the simulation error, not an event:
+
+```text
+agent-tx transfer --guard <GUARD> --token <TOKEN> --to <RECIPIENT> \
+  --amount 10 --agent-secret <OLD_SECRET> --expect-blocked
+(recorded at run time: host signature-trap error output)
+broadcast: no
+```
+
+3. New key admitted:
+
+```text
+agent-tx transfer --guard <GUARD> --token <TOKEN> --to <RECIPIENT> \
+  --amount 10 --agent-secret <NEW_SECRET>
+(recorded at run time: submitted hash, ledger, created_at)
+(recorded at run time: topics [event_auth_checked, allowed])
+```
+
+4. DMS interplay: `status` after step 3 shows the same `last_heartbeat` as
+before step 1 (rotation resets nothing), and a new-key `heartbeat` succeeds
+inside the existing grace.
+
+5. Restore: `rotate_agent_key` back to the canonical pubkey (hash recorded),
+then prove the canonical key spends again. The shared fixture deployment ends
+exactly as it started, so scenarios 1-5 stay reproducible.
+
+### 7. Protocol allowlist admit + deny (pending)
+
+Setup: deploy the minimal protocol contract (record its contract ID as
+`<PROTOCOL>`), then install a scenario policy allowlisting it with a
+per-function rule (`fns` holds `ping`, so `admin_fn` on the same contract
+stays denied). Record the `set_policy` hash as a setup entry.
+
+Scenario 7 needs the `invoke` subcommand in `tools/agent-tx` (transfer and
+heartbeat only today) - specified in that tool's README and implemented in
+the executing PR:
+
+- 7a admit:
+
+```text
+agent-tx invoke --guard <GUARD> --contract <PROTOCOL> --fn ping \
+  --agent-secret <AGENT_SECRET>
+(recorded at run time: submitted hash, ledger, created_at)
+(recorded at run time: topics [event_auth_checked, allowed])
+```
+
+- 7b deny (wrong function, same contract):
+
+```text
+agent-tx invoke --guard <GUARD> --contract <PROTOCOL> --fn admin_fn \
+  --agent-secret <AGENT_SECRET> --expect-blocked
+(recorded at run time: topics [event_auth_checked, blocked, function_not_allowed])
+broadcast: no
+```
+
+- 7c deny (unknown contract - no deployment needed, any address outside
+`assets` and `protocols` exercises the path):
+
+```text
+agent-tx invoke --guard <GUARD> --contract <UNLISTED> --fn anything \
+  --agent-secret <AGENT_SECRET> --expect-blocked
+(recorded at run time: topics [event_auth_checked, blocked, protocol_not_allowed])
+broadcast: no
+```
+
+### 8. Pause gate (pending)
+
+1. Admin installs `paused: true` (record the `set_policy` hash as a setup
+entry).
+2. Agent transfer blocked pre-broadcast. Pause is decision-table gate 4, ahead
+of all classification, so no per-call reasoning applies:
+
+```text
+agent-tx transfer --guard <GUARD> --token <TOKEN> --to <RECIPIENT> \
+  --amount 10 --agent-secret <AGENT_SECRET> --expect-blocked
+(recorded at run time: topics [event_auth_checked, blocked, paused])
+broadcast: no
+```
+
+3. Admin restores `paused: false` (hash recorded); the same transfer succeeds
+(recorded at run time: submitted hash, ledger, created_at, topics
+`[event_auth_checked, allowed]`).
+
 ## Machine-readable index (`index.json`)
 
 [`index.json`](index.json) is the same evidence in a stable shape — **scenario →
@@ -212,6 +350,31 @@ machine contract, and `schema_version` is what a consumer checks first.
 | `scenarios[4].reversal` | object | DMS reversal: `action`, `by` (admin address), `tx`, `ledger`, `event_topics` (`[event_unfrozen]`). |
 | `scenarios[4].post_reversal` | object | The transfer that succeeded after `unfreeze()`: `outcome`, `expected_reason`, `amount`, `tx`, `ledger`, `recorded_utc`, `notes`. |
 | `supplemental_transactions[]` | array | Hashes recorded in prose outside the setup table and the five scenarios (the debug-era transfer), with `canonical_scenario: null` for non-canonical runs. |
+
+### Planned extension (`schema_version: 2`, executing PR)
+
+When scenarios 6-8 land, the index grows with them and consumers must see
+`schema_version: 2`. The executing PR (which closes #49 and #5) does all of
+the following together, so the drift ratchet never passes on a half-migrated
+pair of files:
+
+- `scenarios[]` gains ids 6, 7, and 8 (dense, so `SCENARIO_COUNT` in
+  `tests/fixtures_index.rs` moves 5 to 8 in the same PR). Deny-runs nest the
+  way scenario 5 nests its reversal: scenario 6 carries `old_key_rejected`
+  and `restore` (rotate-back) objects; scenario 7 carries `deny_wrong_fn`
+  and `deny_unknown`; scenario 8 carries `restore` (unpause hash plus the
+  post-restore transfer).
+- New nested shapes need test support, not just data: the old-key rejection
+  is a host signature trap with no `auth_checked` topics, so
+  `old_key_rejected` records a `simulation_error` string and empty
+  `event_topics`; the scenario-7 admit is a protocol call, not a transfer,
+  so `token`/`recipient`/`amount` are null there and the entry carries
+  `protocol` and `fn_name` instead. `assert_scenario` must learn both shapes.
+- Every new setup entry (`set_policy` installs, `rotate_agent_key` and
+  rotate-back, unpause, the `<PROTOCOL>` deployment) goes in
+  `setup_transactions` with its prose table row, and every new contract or
+  account appears in `contracts`/`accounts` (the protocol contract ID is only
+  known at run time).
 
 ### Consistency guarantee
 
@@ -248,6 +411,39 @@ and [dashboard #263](https://github.com/Stellar-Agent-Guard/stellar-agent-guard-
 > gate does not read this README today (it only checks which files a PR
 > touched), so there is no scraper to migrate yet; file the follow-up in that
 > repository if fixture evidence is ever wired into that gate.
+
+## What an operator sees for each recorded scenario
+
+The `→ BLOCKED (pre-broadcast, enforced simulation)` lines above are the CLI
+surface; the `topics: [event_auth_checked, blocked, <reason>]` lines are the
+on-chain surface, and they are the authoritative record of *why*. Both come from
+the same `simulateTransaction` response — the failure arrives as `result.error`
+(a string) with the base64 diagnostic events in `result.events`, not as a
+JSON-RPC `error` object — and the reason symbol is always the **third topic**.
+The complete mapping (including the post-broadcast and bad-signature surfaces)
+is
+[`docs/functions/check-auth.md`](../../docs/functions/check-auth.md#what-an-operator-sees-when-this-rejects-issue-425).
+
+| Scenario | Exit code from `agent-tx` | Reason an operator can decode | Reversal |
+|---|---|---|---|
+| 1 allowed | `0` | `topics: [event_auth_checked, allowed, ""]` — the reason topic is empty on an allow ([`auth-checked-vocabulary.json`](auth-checked-vocabulary.json)) | none needed |
+| 2 per-tx cap | `1` | `per_tx_cap_exceeded`, contract code 22 | lower the amount, or `set_policy` to raise `per_tx_cap` |
+| 3 rolling window | `1` | `window_cap_exceeded`, code 23 | wait for the oldest spend to age out of the window; `set_policy` resets the ledger |
+| 4 allowlist | `1` | `recipient_not_allowed`, code 21 | `set_policy` to add the recipient |
+| 5 dead-man | `1` | `heartbeat_expired`, code 11 — note the heartbeat self-call is **also** blocked, so only the admin can reverse it | admin `unfreeze` (scenario 5 above) |
+
+Two notes that matter when these rows are used to triage a live incident:
+
+- A block never changes state. Scenarios 2–4 consume nothing from the rolling
+  window (SPEC §4 commits admissions only when *every* context passes), so
+  replaying a blocked amount after a policy change behaves as if the failed
+  attempt never happened. Scenario 3's "50 + 110" arithmetic only holds because
+  scenario 1 was admitted.
+- These five scenarios each present a **single** auth context, so the reported
+  reason is that context's reason. A multi-context batch reports the first
+  failing context in iteration order while every context still gets its own
+  `auth_checked` event — worked through in SPEC §6.0 and pinned by
+  `mixed_multi_context_batch_reports_the_first_failing_context` (`src/engine.rs`).
 
 ## How to re-run
 
